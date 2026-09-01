@@ -1,0 +1,40 @@
+# Node.js
+node_modules/
+**/node_modules/
+
+# Terraform files
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.auto.tfvars
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.tfplan
+plan.out
+
+# Kubernetes & Helm
+kubeconfig
+*.kubeconfig
+charts/*.tgz
+
+# Secrets & Keys
+*.pem
+*.key
+*.pub
+id_rsa
+id_rsa.pub
+.env
+.env.*
+
+# IDEs & System Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

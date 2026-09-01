@@ -1,0 +1,223 @@
+pipeline {
+
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins-agent: gitops-agent
+spec:
+  containers:
+  - name: build-tools
+    image: node:20-alpine
+    command:
+    - cat
+    tty: true
+  - name: aws-cli
+    image: amazon/aws-cli:latest
+    command:
+    - sleep
+    args:
+    - 99d
+  - name: dind
+    image: docker:dind
+    securityContext:
+      privileged: true
+'''
+        }
+    }
+
+    environment {
+        // AWS Settings
+        AWS_REGION         = 'us-east-1'
+        AWS_CRED_ID        = 'aws-ecr-credentials'
+        ECR_REPOSITORY     = 'dev-app-repo'
+        IMAGE_TAG          = "${BUILD_NUMBER}"
+
+        // GitHub Settings
+        GIT_CRED_ID        = 'github-credentials'
+        GIT_BRANCH         = 'master'
+        GIT_REPO_URL       = 'https://github.com/abdelrahmanelfekyy-cloud/End-To-End-GitOps-project.git'
+
+        // Kubernetes Manifest
+        K8S_MANIFEST       = 'k8s-argo/deployment.yml'
+    }
+
+    stages {
+
+        // 1. CHECKOUT
+        stage('Checkout') {
+            steps {
+                echo "======================================"
+                echo "CHECKOUT"
+                echo "======================================"
+
+                git branch: "${GIT_BRANCH}",
+                    credentialsId: "${GIT_CRED_ID}",
+                    url: "${GIT_REPO_URL}"
+
+                sh '''
+                    echo "Current branch:"
+                    git branch --show-current
+                    echo "Current commit:"
+                    git log -1 --oneline
+                '''
+            }
+        }
+
+        // 2. INSTALL DEPENDENCIES
+        stage('Install Dependencies') {
+            steps {
+                container('build-tools') {
+                    dir('app') {
+                        sh '''
+                            echo "======================================"
+                            echo "NODE.JS INFORMATION & INSTALLATION"
+                            echo "======================================"
+                            node --version
+                            npm --version
+                            npm ci
+                        '''
+                    }
+                }
+            }
+        }
+
+        // 3. TEST
+        stage('Test') {
+            steps {
+                container('build-tools') {
+                    dir('app') {
+                        sh '''
+                            echo "======================================"
+                            echo "RUNNING TESTS"
+                            echo "======================================"
+                            if npm run | grep -q "test"; then
+                                echo "Running npm test..."
+                                npm test
+                            else
+                                echo "No test script found in package.json. Skipping."
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        // 4. GET ECR IMAGE NAME
+        stage('Get ECR Image Name') {
+            steps {
+                withCredentials([amazonWebServices(credentialsId: "${AWS_CRED_ID}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    container('aws-cli') {
+                        script {
+                            echo "======================================"
+                            echo "GET ECR IMAGE NAME"
+                            echo "======================================"
+                            def accountId = sh(
+                                script: 'aws sts get-caller-identity --query Account --output text',
+                                returnStdout: true
+                            ).trim()
+
+                            env.IMAGE_NAME = "${accountId}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+                            echo "Full Image Name: ${env.IMAGE_NAME}:${IMAGE_TAG}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. BUILD DOCKER IMAGE
+        stage('Build Docker Image') {
+            steps {
+                container('dind') {
+                    dir('app') {
+                        sh '''
+                            echo "======================================"
+                            echo "BUILDING DOCKER IMAGE"
+                            echo "======================================"
+                            docker build \
+                                -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                                -t ${IMAGE_NAME}:latest \
+                                .
+                        '''
+                    }
+                }
+            }
+        }
+
+        // 6. LOGIN & PUSH TO ECR
+        stage('Login & Push to ECR') {
+            steps {
+                withCredentials([amazonWebServices(credentialsId: "${AWS_CRED_ID}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    container('aws-cli') {
+                        sh '''
+                            echo "======================================"
+                            echo "LOGIN & PUSH TO AMAZON ECR"
+                            echo "======================================"
+                            ECR_DOMAIN=$(echo ${IMAGE_NAME} | cut -d'/' -f1)
+
+                            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_DOMAIN}
+
+                            docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                            docker push ${IMAGE_NAME}:latest
+                            echo "Successfully pushed ${IMAGE_NAME}:${IMAGE_TAG} to ECR"
+                        '''
+                    }
+                }
+            }
+        }
+
+        // 7. GITOPS - UPDATE KUBERNETES MANIFEST
+        stage('GitOps - Update Manifest') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: "${GIT_CRED_ID}", usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+                    container('build-tools') {
+                        sh '''
+                            echo "======================================"
+                            echo "UPDATING MANIFEST & PUSH TO GITHUB"
+                            echo "======================================"
+                            test -f "${K8S_MANIFEST}"
+
+                            sed -i "s|image:.*|image: ${IMAGE_NAME}:${IMAGE_TAG}|g" "${K8S_MANIFEST}"
+
+                            git config user.name "Jenkins CI"
+                            git config user.email "jenkins@ci.local"
+
+                            git add "${K8S_MANIFEST}"
+
+                            if git diff --staged --quiet; then
+                                echo "No changes detected in manifest."
+                            else
+                                git commit -m "chore(gitops): update image tag to ${IMAGE_TAG} [skip ci]"
+                                AUTH_REPO_URL=$(echo "${GIT_REPO_URL}" | sed "s|https://|https://${GIT_USER}:${GIT_TOKEN}@|")
+                                git push "${AUTH_REPO_URL}" "HEAD:${GIT_BRANCH}"
+                                echo "GitOps manifest updated successfully."
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            container('dind') {
+                sh '''
+                    if [ -n "${IMAGE_NAME}" ]; then
+                        docker rmi "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest" || true
+                    fi
+                '''
+            }
+            deleteDir()
+        }
+        success {
+            echo "PIPELINE COMPLETED SUCCESSFULLY!"
+        }
+        failure {
+            echo "PIPELINE FAILED. Please check stage logs."
+        }
+    }
+}
