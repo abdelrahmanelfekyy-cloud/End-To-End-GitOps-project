@@ -1,29 +1,62 @@
+```groovy
 pipeline {
+
+    // =========================================================
+    // JENKINS AGENT
+    // =========================================================
     agent {
         kubernetes {
             yaml '''
 apiVersion: v1
 kind: Pod
+
 metadata:
   labels:
     jenkins-pipeline: devops-build
+
 spec:
+
+  # Run this Jenkins Agent Pod only on the Node
+  # that has the label: jenkins=true
+  nodeSelector:
+    jenkins: "true"
+
   containers:
+
+  # ---------------------------------------------------------
+  # Node.js / npm container
+  # ---------------------------------------------------------
   - name: build-tools
     image: node:18-alpine
-    command: ['cat']
+    command:
+    - cat
     tty: true
+
+  # ---------------------------------------------------------
+  # AWS CLI container
+  # ---------------------------------------------------------
   - name: aws-cli
     image: amazon/aws-cli:latest
-    command: ['cat']
+    command:
+    - cat
     tty: true
+
+  # ---------------------------------------------------------
+  # Docker CLI container
+  # ---------------------------------------------------------
   - name: docker
     image: docker:24.0.7-cli
-    command: ['cat']
+    command:
+    - cat
     tty: true
+
     volumeMounts:
     - name: docker-sock
       mountPath: /var/run/docker.sock
+
+  # ---------------------------------------------------------
+  # Docker Socket
+  # ---------------------------------------------------------
   volumes:
   - name: docker-sock
     hostPath:
@@ -32,83 +65,426 @@ spec:
         }
     }
 
+    // =========================================================
+    // ENVIRONMENT
+    // =========================================================
     environment {
-        AWS_REGION            = 'us-east-1'
-        ECR_REPOSITORY        = 'your-app-repo' // استبدل باسم الـ ECR Repository
-        AWS_ACCESS_KEY_ID     = credentials('AWS_ACCESS_KEY_ID')     // اسم الـ Credential في Jenkins
-        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY') // اسم الـ Credential في Jenkins
-        IMAGE_TAG             = "${BUILD_NUMBER}"
+
+        AWS_REGION     = 'us-east-1'
+
+        // Change this to your ECR repository name
+        ECR_REPOSITORY = 'dev-app-repo'
+
+        // Jenkins build number
+        IMAGE_TAG      = "${BUILD_NUMBER}"
     }
 
+    // =========================================================
+    // STAGES
+    // =========================================================
     stages {
+
+        // =====================================================
+        // 1. CHECKOUT
+        // =====================================================
         stage('Checkout') {
+
             steps {
+
+                echo "======================================"
+                echo "CHECKOUT SOURCE CODE"
+                echo "======================================"
+
                 checkout scm
+
+                sh '''
+                    echo "Current branch:"
+                    git branch --show-current
+
+                    echo ""
+                    echo "Current commit:"
+                    git log -1 --oneline
+
+                    echo ""
+                    echo "Workspace:"
+                    pwd
+
+                    echo ""
+                    echo "Files:"
+                    ls -la
+                '''
             }
         }
 
+
+        // =====================================================
+        // 2. INSTALL DEPENDENCIES
+        // =====================================================
         stage('Install Dependencies') {
+
             steps {
+
                 container('build-tools') {
+
                     dir('app') {
-                        sh 'npm ci || npm install'
+
+                        sh '''
+                            echo "======================================"
+                            echo "NODE.JS INFORMATION"
+                            echo "======================================"
+
+                            node --version
+                            npm --version
+
+                            echo ""
+                            echo "Installing dependencies..."
+
+                            if [ -f package-lock.json ]; then
+                                npm ci
+                            else
+                                npm install
+                            fi
+
+                            echo ""
+                            echo "Dependencies installed successfully."
+                        '''
                     }
                 }
             }
         }
 
-        stage('Get ECR Image Name') {
-            steps {
-                container('aws-cli') {
-                    script {
-                        def accountId = sh(
-                            script: 'aws sts get-caller-identity --query Account --output text',
-                            returnStdout: true
-                        ).trim()
 
-                        if (!accountId) {
-                            error "Failed to retrieve AWS Account ID"
+        // =====================================================
+        // 3. TEST
+        // =====================================================
+        stage('Test') {
+
+            steps {
+
+                container('build-tools') {
+
+                    dir('app') {
+
+                        sh '''
+                            echo "======================================"
+                            echo "RUNNING TESTS"
+                            echo "======================================"
+
+                            if npm run | grep -q "test"; then
+
+                                echo "Test script found."
+                                echo "Running npm test..."
+
+                                npm test
+
+                            else
+
+                                echo "No test script found in package.json."
+                                echo "Skipping tests."
+
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+
+        // =====================================================
+        // 4. CHECK DOCKER
+        // =====================================================
+        stage('Check Docker') {
+
+            steps {
+
+                container('docker') {
+
+                    sh '''
+                        echo "======================================"
+                        echo "CHECK DOCKER"
+                        echo "======================================"
+
+                        docker --version
+
+                        echo ""
+                        echo "Checking Docker daemon..."
+
+                        docker info
+
+                        echo ""
+                        echo "Docker is available."
+                    '''
+                }
+            }
+        }
+
+
+        // =====================================================
+        // 5. GET AWS ACCOUNT ID
+        // =====================================================
+        stage('Get AWS Account ID') {
+
+            steps {
+
+                withCredentials([
+                    amazonWebServices(
+                        credentialsId: 'aws-ecr-credentials',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+
+                    container('aws-cli') {
+
+                        script {
+
+                            echo "======================================"
+                            echo "GET AWS ACCOUNT ID"
+                            echo "======================================"
+
+                            def accountId = sh(
+                                script: '''
+                                    aws sts get-caller-identity \
+                                    --query Account \
+                                    --output text
+                                ''',
+                                returnStdout: true
+                            ).trim()
+
+                            if (!accountId) {
+                                error "Failed to retrieve AWS Account ID"
+                            }
+
+                            env.AWS_ACCOUNT_ID = accountId
+
+                            env.ECR_REGISTRY =
+                                "${accountId}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+                            env.FULL_IMAGE_NAME =
+                                "${env.ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+                            echo "AWS Account ID: ${env.AWS_ACCOUNT_ID}"
+                            echo "ECR Registry: ${env.ECR_REGISTRY}"
+                            echo "Image: ${env.FULL_IMAGE_NAME}"
+                        }
+                    }
+                }
+            }
+        }
+
+
+        // =====================================================
+        // 6. LOGIN TO ECR
+        // =====================================================
+        stage('Login to ECR') {
+
+            steps {
+
+                withCredentials([
+                    amazonWebServices(
+                        credentialsId: 'aws-ecr-credentials',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+
+                    script {
+
+                        echo "======================================"
+                        echo "LOGIN TO AMAZON ECR"
+                        echo "======================================"
+
+                        def ecrPassword
+
+                        // Get ECR authentication password
+                        container('aws-cli') {
+
+                            ecrPassword = sh(
+                                script: '''
+                                    aws ecr get-login-password \
+                                    --region ${AWS_REGION}
+                                ''',
+                                returnStdout: true
+                            ).trim()
                         }
 
-                        env.AWS_ACCOUNT_ID  = accountId
-                        env.FULL_IMAGE_NAME = "${accountId}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
-                        echo "Target ECR Image: ${env.FULL_IMAGE_NAME}"
+                        // Login using Docker container
+                        container('docker') {
+
+                            sh """
+                                echo "${ecrPassword}" | docker login \
+                                    --username AWS \
+                                    --password-stdin \
+                                    ${env.ECR_REGISTRY}
+                            """
+
+                            echo "Successfully logged in to ECR."
+                        }
                     }
                 }
             }
         }
 
-        stage('Build & Push Docker Image') {
-            steps {
-                script {
-                    def loginCmd = container('aws-cli') {
-                        sh(
-                            script: "aws ecr get-login-password --region ${AWS_REGION}",
-                            returnStdout: true
-                        ).trim()
-                    }
 
-                    container('docker') {
-                        sh """
-                            echo "${loginCmd}" | docker login --username AWS --password-stdin ${env.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
-                            cd app
-                            docker build -t ${env.FULL_IMAGE_NAME} .
-                            docker push ${env.FULL_IMAGE_NAME}
-                        """
+        // =====================================================
+        // 7. BUILD DOCKER IMAGE
+        // =====================================================
+        stage('Build Docker Image') {
+
+            steps {
+
+                container('docker') {
+
+                    dir('app') {
+
+                        sh '''
+                            echo "======================================"
+                            echo "BUILD DOCKER IMAGE"
+                            echo "======================================"
+
+                            echo "Image:"
+                            echo "${FULL_IMAGE_NAME}"
+
+                            docker build \
+                                -t "${FULL_IMAGE_NAME}" \
+                                -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest" \
+                                .
+
+                            echo ""
+                            echo "Docker image built successfully."
+
+                            docker images
+                        '''
                     }
+                }
+            }
+        }
+
+
+        // =====================================================
+        // 8. PUSH IMAGE TO ECR
+        // =====================================================
+        stage('Push Image to ECR') {
+
+            steps {
+
+                container('docker') {
+
+                    sh '''
+                        echo "======================================"
+                        echo "PUSH IMAGE TO AMAZON ECR"
+                        echo "======================================"
+
+                        echo "Pushing:"
+                        echo "${FULL_IMAGE_NAME}"
+
+                        docker push "${FULL_IMAGE_NAME}"
+
+                        echo ""
+                        echo "Pushing latest tag:"
+
+                        docker push \
+                            "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+
+                        echo ""
+                        echo "======================================"
+                        echo "IMAGE PUSHED SUCCESSFULLY"
+                        echo "======================================"
+
+                        echo "Image:"
+                        echo "${FULL_IMAGE_NAME}"
+
+                        echo "Latest:"
+                        echo "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+                    '''
                 }
             }
         }
     }
 
+
+    // =========================================================
+    // POST ACTIONS
+    // =========================================================
     post {
+
         always {
-            // 1. تنظيف node_modules لمنع خطأ الصلاحيات
+
+            echo "======================================"
+            echo "CLEANUP"
+            echo "======================================"
+
+            // -------------------------------------------------
+            // Remove node_modules
+            // -------------------------------------------------
             container('build-tools') {
-                sh 'rm -rf app/node_modules'
+
+                sh '''
+                    echo "Removing node_modules..."
+
+                    rm -rf app/node_modules || true
+
+                    echo "node_modules removed."
+                '''
             }
-            // 2. استخدام الأمر المدمج لحذف الـ Workspace بدون حاجتك لـ workspace-cleanup plugin
+
+            // -------------------------------------------------
+            // Remove Docker images
+            // -------------------------------------------------
+            container('docker') {
+
+                sh '''
+                    echo "Removing local Docker images..."
+
+                    if [ -n "${FULL_IMAGE_NAME}" ]; then
+
+                        docker rmi "${FULL_IMAGE_NAME}" || true
+
+                        docker rmi \
+                            "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest" \
+                            || true
+
+                    fi
+
+                    echo "Docker cleanup completed."
+                '''
+            }
+
+            // -------------------------------------------------
+            // Delete Jenkins workspace
+            // -------------------------------------------------
             deleteDir()
+        }
+
+
+        // =====================================================
+        // SUCCESS
+        // =====================================================
+        success {
+
+            echo "======================================"
+            echo "PIPELINE COMPLETED SUCCESSFULLY!"
+            echo "======================================"
+
+            echo "ECR Repository:"
+            echo "${ECR_REPOSITORY}"
+
+            echo "Image Tag:"
+            echo "${IMAGE_TAG}"
+        }
+
+
+        // =====================================================
+        // FAILURE
+        // =====================================================
+        failure {
+
+            echo "======================================"
+            echo "PIPELINE FAILED!"
+            echo "======================================"
+
+            echo "Please check the failed stage logs."
         }
     }
 }
+```
