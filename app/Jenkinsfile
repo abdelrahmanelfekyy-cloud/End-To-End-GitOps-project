@@ -33,9 +33,11 @@ spec:
     }
 
     environment {
-        AWS_REGION     = 'us-east-1'
-        ECR_REPOSITORY = 'your-app-repo' // استبدل الاسم باسم الـ Repo الخاص بك
-        IMAGE_TAG      = "${BUILD_NUMBER}"
+        AWS_REGION            = 'us-east-1'
+        ECR_REPOSITORY        = 'your-app-repo' // استبدل باسم الـ ECR Repository
+        AWS_ACCESS_KEY_ID     = credentials('AWS_ACCESS_KEY_ID')     // اسم الـ Credential في Jenkins
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY') // اسم الـ Credential في Jenkins
+        IMAGE_TAG             = "${BUILD_NUMBER}"
     }
 
     stages {
@@ -59,7 +61,6 @@ spec:
             steps {
                 container('aws-cli') {
                     script {
-                        // استخراج الـ Account ID وتعيينه كـ Environment Variable
                         def accountId = sh(
                             script: 'aws sts get-caller-identity --query Account --output text',
                             returnStdout: true
@@ -80,7 +81,6 @@ spec:
         stage('Build & Push Docker Image') {
             steps {
                 script {
-                    // تسجيل الدخول إلى ECR من داخل حاوية aws-cli
                     def loginCmd = container('aws-cli') {
                         sh(
                             script: "aws ecr get-login-password --region ${AWS_REGION}",
@@ -88,7 +88,6 @@ spec:
                         ).trim()
                     }
 
-                    // بناء الصورة ورفعها من داخل حاوية docker
                     container('docker') {
                         sh """
                             echo "${loginCmd}" | docker login --username AWS --password-stdin ${env.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
@@ -104,12 +103,12 @@ spec:
 
     post {
         always {
-            // 1. تنظيف ملفات node_modules من داخل نفس الحاوية المُنكِرة لمنع مشكلة الصلاحيات
+            // 1. تنظيف node_modules لمنع خطأ الصلاحيات
             container('build-tools') {
                 sh 'rm -rf app/node_modules'
             }
-            // 2. مسح الـ Workspace بالكامل
-            cleanWs()
+            // 2. استخدام الأمر المدمج لحذف الـ Workspace بدون حاجتك لـ workspace-cleanup plugin
+            deleteDir()
         }
     }
 }
